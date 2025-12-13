@@ -24,16 +24,11 @@ from typing import Any, Generator, Iterable, Literal
 import h5py
 import numpy as np
 import numpy.typing as npt
-import pandas as pd
-import matplotlib
-import matplotlib.pyplot as plt
 import polars as pl
-import sklearn
-import pynwb
 import tqdm
 import upath
 import zarr
-from polars.typing_ import FrameType
+import numba
 
 import numba_psth
 
@@ -42,9 +37,18 @@ logger = logging.getLogger(__name__)
 CO_COMPUTATION_ID = os.environ.get("CO_COMPUTATION_ID")
 AWS_BATCH_JOB_ID = os.environ.get("AWS_BATCH_JOB_ID")
 
+logger = logging.getLogger(__name__)
+
+CCF_MIDLINE_ML = 5700
+
+CACHE_VERSION = "v0.0.272"
+
 def is_pipeline():
     return bool(AWS_BATCH_JOB_ID)
 
+class NoSpikeTimesError(Exception):
+    pass
+    
 # logging ----------------------------------------------------------- #
 class PSTFormatter(logging.Formatter):
 
@@ -142,7 +146,7 @@ def setup_logging(
 def get_session_table() -> pl.DataFrame:
     return pl.read_parquet(get_datacube_dir() / 'session_table.parquet')
     
-def get_df(component: str, lazy: bool = True) -> FrameType:
+def get_df(component: str, lazy: bool = False) -> pl.DataFrame | pl.LazyFrame:
     path = get_datacube_dir() / 'consolidated' / f'{component}.parquet'
     if lazy:
         frame = pl.scan_parquet(path)
@@ -159,38 +163,6 @@ def get_df(component: str, lazy: bool = True) -> FrameType:
 def get_nwb_paths() -> tuple[pathlib.Path, ...]:
     return tuple(get_data_root().rglob('*.nwb'))
 
-def get_nwb(session_id_or_path: str | pathlib.Path, raise_on_missing: bool = True, raise_on_bad_file: bool = True) -> pynwb.NWBFile:
-    if isinstance(session_id_or_path, (pathlib.Path, upath.UPath)):
-        nwb_path = session_id_or_path
-    else:
-        if not isinstance(session_id_or_path, str):
-            raise TypeError(f"Input should be a session ID (str) or path to an NWB file (str/Path), got: {session_id_or_path!r}")
-        if pathlib.Path(session_id_or_path).exists():
-            nwb_path = session_id_or_path
-        elif session_id_or_path.endswith(".nwb") and any(p.name == session_id_or_path for p in get_nwb_paths()):
-            nwb_path = next(p for p in get_nwb_paths() if p.name == session_id_or_path)
-        else:
-            try:
-                nwb_path = next(p for p in get_nwb_paths() if p.stem == session_id_or_path)
-            except StopIteration:
-                msg = f"Could not find NWB file for {session_id_or_path!r}"
-                if not raise_on_missing:
-                    logger.error(msg)
-                    return
-                else:
-                    raise FileNotFoundError(f"{msg}. Available files: {[p.name for p in get_nwb_paths()]}") from None
-    logger.info(f"Reading {nwb_path}")
-    try:
-        nwb = pynwb.NWBHDF5IO(nwb_path).read()
-    except RecursionError:
-        msg = f"{nwb_path.name} cannot be read due to RecursionError (hdf5 may still be accessible)"
-        if not raise_on_bad_file:
-            logger.error(msg)
-            return
-        else:
-            raise RecursionError(msg)
-    else:
-        return nwb
         
 def _get_spike_times_single_nwb(nwb_path: str | pathlib.Path, unit_ids: str | Iterable[str], use_pynwb: bool = True) -> dict[str, npt.NDArray[np.float64]]:    
     if isinstance(unit_ids, str):
@@ -349,6 +321,8 @@ def get_per_trial_spike_times(
     trials_frame: str | polars._typing.FrameType = 'trials', 
     apply_obs_intervals: bool = True,
     as_counts: bool = False,
+    as_binarized_array: bool = False,
+    binarized_trial_length: int | None = None,
     keep_only_necessary_cols: bool = True,
 ) -> pl.DataFrame:
     """"""
@@ -377,6 +351,16 @@ def get_per_trial_spike_times(
         raise ValueError("starts, ends, and col_names must have the same length")
     if isinstance(trials_frame, str):
         trials_df = get_df(trials_frame)
+    elif isinstance(trials_frame, pl.LazyFrame):
+        trials_df = trials_frame.collect()
+    else:
+        assert isinstance(trials_frame, pl.DataFrame), 'expected trials_frame to be a pl.DataFrame or LazyFrame'
+        trials_df = trials_frame
+
+    if as_binarized_array:
+        assert isinstance(binarized_trial_length, float), 'if tensor,  must be float (length of trial in seconds)'
+        binarized_trial_length_in_ms = int(binarized_trial_length / 0.001)  # convert to number of 1ms bins
+
     trials_df = (
         trials_df
         .filter(pl.col('session_id').is_in(units_df['session_id'].unique()))
@@ -411,18 +395,28 @@ def get_per_trial_spike_times(
             if row['unit_id'] is None:
                 raise ValueError(f"Missing unit_id in {row=}")
             results['unit_id'].extend([row['unit_id']] * len(session_trials))
-            
+
             for (start, end, col_name) in zip(starts, ends, col_names):
                 # get spike times with start:end interval for each row of the trials table
                 spike_times = spike_times_all_units[row['unit_id']]
-                spikes_in_intervals: list[list[float]] | list[float] = []
-                for a, b in np.searchsorted(spike_times, session_trials[f"{temp_col_prefix}_{col_name}"].to_list()):
-                    spike_times_in_interval = spike_times[a:b]
+                spikes_in_intervals  = []
+                for interval_index, (a, b) in enumerate(np.searchsorted(spike_times, session_trials[f"{temp_col_prefix}_{col_name}"].to_list())):
+                    spike_times_in_interval = spike_times[a:b] 
                     #! spikes coincident with end of interval are not included
                     if as_counts:
                         spikes_in_intervals.append(len(spike_times_in_interval))
+                    elif as_binarized_array:
+                        bin_size = 0.001
+                        this_interval_start = session_trials[f"{temp_col_prefix}_{col_name}"][interval_index][0]
+                        this_interval_end = session_trials[f"{temp_col_prefix}_{col_name}"][interval_index][1]
+                        spike_vector = np.zeros(binarized_trial_length_in_ms, dtype=bool)
+                        relative_interval_spike_times = np.floor((spike_times_in_interval - this_interval_start) / bin_size).astype(int)
+                        relative_interval_spike_times = relative_interval_spike_times[relative_interval_spike_times<binarized_trial_length_in_ms]
+                        np.add.at(spike_vector, relative_interval_spike_times, 1)
+                        spikes_in_intervals.append(spike_vector)
+
                     else:
-                        spikes_in_intervals.append(spike_times_in_interval.tolist())
+                        spikes_in_intervals.append((spike_times_in_interval-session_trials[f"{temp_col_prefix}_{col_name}"][interval_index][0]).tolist())
                 results[col_name].extend(spikes_in_intervals)
                 
     if apply_obs_intervals or not keep_only_necessary_cols:
@@ -495,12 +489,13 @@ class UnitResponse:
 @dataclasses.dataclass(repr=False)
 class Condition:
     """Bundle of parameters that define a condition, and placeholder for unit responses under that condition. Make tens of these."""
-    trials_filter: pl.expr | Iterable[pl.expr]
-    session_table_filter: pl.expr | Iterable[pl.expr]
-    units_filter: pl.expr | Iterable[pl.expr]
+    trials_filter: Iterable[pl.expr]
+    session_table_filter: Iterable[pl.expr]
+    units_filter: Iterable[pl.expr]
     area: str
-    context: str
     stim: str
+    is_null: bool
+    context: str | None = None
     # fields that are filled in after data processing:
     unit_responses: tuple[UnitResponse, ...] = None
     bins: npt.NDArray[np.float64] = None
@@ -578,7 +573,7 @@ def process_conditions_by_area(
         get_df('units', lazy=True)
         .filter(conditions[0].units_filter)
         .join(
-            other=get_session_table(lazy=True).filter(conditions[0].session_table_filter),
+            other=get_session_table().lazy().filter(conditions[0].session_table_filter),
             on='session_id',
             how='semi', # keeps rows in left table that have a match in right table
         )
@@ -586,7 +581,7 @@ def process_conditions_by_area(
     logger.debug(f"Getting spike times for {conditions[0].area}") 
     unit_id_to_spike_times: dict[str, npt.NDArray[np.float64]] = get_spike_times(select_units['unit_id'])
     if not unit_id_to_spike_times:
-        raise ValueError(f"No unit spike times returned for {conditions[0].area}: check units and session table filter expressions")
+        raise NoSpikeTimesError(f"No unit spike times returned for {conditions[0].area}: check units and session table filter expressions")
     trials = get_df('trials')
     for condition in conditions:
         # get psth for each unit in area, for trials that match the parameters of this condition 
@@ -678,6 +673,296 @@ def ensure_nonempty_results_dir() -> None:
         path = results / uuid.uuid4().hex
         logger.info(f"Creating {path} to ensure results folder is not empty")
         path.touch()
+
+
+
+@functools.cache
+def get_ccf_structure_tree_df() -> pl.DataFrame:
+    local_path = upath.UPath(
+        "//allen/programs/mindscope/workgroups/np-behavior/ccf_structure_tree_2017.csv"
+    )
+    cloud_path = upath.UPath(
+        "https://raw.githubusercontent.com/cortex-lab/allenCCF/master/structure_tree_safe_2017.csv"
+    )
+    path = local_path if local_path.exists() else cloud_path
+    logging.info(f"Using CCF structure tree from {path.as_posix()}")
+    return (
+        pl.read_csv(path.as_posix())
+        .lazy()
+        .with_columns(
+            color_hex_int=pl.col("color_hex_triplet").str.to_integer(base=16),
+            color_hex_str=pl.lit("0x") + pl.col("color_hex_triplet"),
+        )
+        .with_columns(
+            r=pl.col("color_hex_triplet")
+            .str.slice(0, 2)
+            .str.to_integer(base=16)
+            .mul(1 / 255),
+            g=pl.col("color_hex_triplet")
+            .str.slice(2, 2)
+            .str.to_integer(base=16)
+            .mul(1 / 255),
+            b=pl.col("color_hex_triplet")
+            .str.slice(4, 2)
+            .str.to_integer(base=16)
+            .mul(1 / 255),
+        )
+        .with_columns(
+            color_rgb=pl.concat_list("r", "g", "b"),
+        )
+        .drop("r", "g", "b")
+    ).collect()
+
+
+@functools.cache
+def get_good_units_df() -> pl.DataFrame:
+    good_units = (
+        get_component_lf("session")
+        .filter(pl.col("keywords").list.contains("templeton").not_())
+        .join(
+            other=(
+                get_component_lf("performance")
+                .filter(
+                    pl.col("same_modal_dprime") > 1.0,
+                    pl.col("cross_modality_dprime") > 1.0,
+                )
+                .group_by(pl.col("session_id"))
+                .agg(
+                    [
+                        (pl.col("block_index").count() > 3).alias("pass"),
+                    ],
+                )
+                .filter("pass")
+                .drop("pass")
+            ),
+            on="session_id",
+            how="semi",  # only keep rows in left table (sessions) that have match in right table (ie pass performance)
+        )
+        .join(
+            other=(
+                get_component_lf("units").filter(
+                    pl.col("isi_violations_ratio") < 0.5,
+                    pl.col("amplitude_cutoff") < 0.1,
+                    pl.col("presence_ratio") > 0.95,
+                )
+            ),
+            on="session_id",
+        )
+        .join(
+            other=(
+                get_component_lf("electrode_groups")
+                .rename(
+                    {
+                        "name": "electrode_group_name",
+                        "location": "implant_location",
+                    }
+                )
+                .select("session_id", "electrode_group_name", "implant_location")
+            ),
+            on=("session_id", "electrode_group_name"),
+        )
+        .with_columns((pl.col("ccf_ml") > CCF_MIDLINE_ML).alias("is_right_hemisphere"))
+        .join(
+            other=get_ccf_structure_tree_df().lazy(),
+            right_on="acronym",
+            left_on="location",
+        )
+    ).collect()
+    logger.info(f"Fetched {len(good_units)} good units")
+    return good_units
+
+
+from typing import TypeVar
+
+T = TypeVar("T", pl.DataFrame, pl.LazyFrame)
+
+
+def filter_prod_sessions(
+    df: T,
+    cross_modal_dprime_threshold: float = 1.0,
+    late_autorewards: bool | None = None,
+) -> T:
+    """
+    Filter the dataframe to only include sessions that are pass dprime threshold
+    specified in at least 3 blocks.
+
+    usage:
+    electrodes = get_component_df("electrodes").pipe(filter_prod_sessions, cross_modal_dprime_threshold=1.0)
+    """
+    prod_trials = get_prod_trials(cross_modal_dprime_threshold, late_autorewards)
+    if isinstance(df, pl.LazyFrame):
+        prod_trials = prod_trials.lazy()
+    return df.join(
+        other=prod_trials,
+        on="session_id",
+        how="semi",  # only keep rows in left table that have match in right table (ie prod sessions)
+    )
+
+
+@functools.cache
+def get_prod_trials(
+    cross_modal_dprime_threshold: float = 1.0, late_autorewards: bool | None = None
+) -> pl.DataFrame:
+    if late_autorewards is None:
+        late_autorewards_expr = pl.lit(True)
+    elif late_autorewards is True:
+        late_autorewards_expr = (
+            pl.col("keywords").list.contains("late_autorewards") is True
+        )
+    elif late_autorewards is False:
+        late_autorewards_expr = (
+            pl.col("keywords").list.contains("early_autorewards") is True
+        )
+
+    return (
+        get_component_df("trials")
+        .join(
+            other=(
+                get_component_df("session").filter(
+                    pl.col("keywords").list.contains("production"),
+                    ~pl.col("keywords").list.contains("issues"),
+                    pl.col("keywords").list.contains("task"),
+                    pl.col("keywords").list.contains("ephys"),
+                    pl.col("keywords").list.contains("ccf"),
+                    ~pl.col("keywords").list.contains("opto_perturbation"),
+                    ~pl.col("keywords").list.contains("opto_control"),
+                    ~pl.col("keywords").list.contains("injection_perturbation"),
+                    ~pl.col("keywords").list.contains("injection_control"),
+                    ~pl.col("keywords").list.contains("hab"),
+                    ~pl.col("keywords").list.contains("training"),
+                    ~pl.col("keywords").list.contains("context_naive"),
+                    ~pl.col("keywords").list.contains("templeton"),
+                    late_autorewards_expr,
+                )
+            ),
+            on="session_id",
+            how="semi",
+        )
+        # exclude sessions based on task performance:
+        .join(
+            other=(
+                get_component_df("performance")
+                .filter(
+                    # pl.col('same_modal_dprime') > 1.0,
+                    pl.col("cross_modality_dprime")
+                    > cross_modal_dprime_threshold,
+                )
+                .with_columns(
+                    pl.col("block_index")
+                    .count()
+                    .over("session_id")
+                    .alias("n_passing_blocks"),
+                )
+                .filter(
+                    pl.col("n_passing_blocks") > 3,
+                )
+            ),
+            on="session_id",
+            how="semi",
+        )
+        # filter blocks with too few trials:
+        .with_columns(
+            pl.col("trial_index_in_block")
+            .max()
+            .over("session_id", "block_index")
+            .alias("n_trials_in_block"),
+        )
+        .filter(
+            pl.col("n_trials_in_block") > 10,
+        )
+        # filter sessions with too few blocks:
+        .filter(
+            pl.col("block_index").n_unique().over("session_id") == 6,
+            pl.col("block_index").max().over("session_id") == 5,
+        )
+        # add a column that indicates if the first block in a session is aud context:
+        .with_columns(
+            (pl.col("rewarded_modality").first() == "aud")
+            .over("session_id")
+            .alias("is_first_block_aud"),
+        )
+    )
+
+
+
+
+def write_unit_context_columns(units_df: pl.DataFrame | None = None) -> None:
+    """Takes ~5 hours for all units"""
+    import tqdm
+
+    import npc_sessions_cache.plots.ephys as ephys
+
+    all_new_cols = []
+    if units_df is None:
+        units_df = get_good_units_df()
+    for unit_id, session_id in tqdm.tqdm(
+        units_df["unit_id", "session_id"].iter_rows(), total=len(get_good_units_df())
+    ):
+        new_cols = {}
+        spike_times_session_id = "_".join(unit_id.split("_")[:2])
+        unit_spike_times = get_component_zarr("spike_times")[spike_times_session_id][
+            unit_id
+        ][:]
+        trials = get_component_df("trials").filter(pl.col("session_id") == session_id)
+        new_cols["unit_id"] = unit_id
+        for stim in ("vis", "aud"):
+            for target in ("target", "nontarget"):
+                for context in ("vis", "aud"):
+                    psth = ephys.makePSTH_numba(
+                        spikes=unit_spike_times,
+                        startTimes=trials.filter(
+                            pl.col(f"is_{stim}_{target}"),
+                            pl.col(f"is_{context}_context"),
+                        )["quiescent_start_time"].to_numpy(),
+                        windowDur=1.5,
+                        binSize=0.025,
+                    )
+                    new_cols[f"{stim}_{target}_{context}_context_baseline_rate"] = (
+                        np.mean(psth)
+                    )
+                a = new_cols[f"{stim}_{target}_aud_context_baseline_rate"]
+                v = new_cols[f"{stim}_{target}_vis_context_baseline_rate"]
+                new_cols[f"{stim}_{target}_context_selectivity_index"] = (a - v) / (
+                    a + v
+                )
+        all_new_cols.append(new_cols)
+    pl.DataFrame(all_new_cols).write_parquet("unit_context_columns.parquet")
+
+
+def get_units_with_context_columns(
+    units_df: pl.DataFrame | None = None,
+) -> pl.DataFrame:
+    if units_df is None:
+        units_df = get_good_units_df()
+    return units_df.join(pl.read_parquet("unit_context_columns.parquet"), on="unit_id")
+
+
+@numba.njit
+def makePSTH_numba(
+    spikes: npt.NDArray[np.floating],
+    startTimes: npt.NDArray[np.floating],
+    windowDur: float,
+    binSize: float = 0.001,
+    convolution_kernel: float = 0.05,
+):
+    spikes = spikes.flatten()
+    startTimes = startTimes - convolution_kernel / 2
+    windowDur = windowDur + convolution_kernel
+    bins = np.arange(0, windowDur + binSize, binSize)
+    convkernel = np.ones(int(convolution_kernel / binSize))
+    counts = np.zeros(bins.size - 1)
+    for _i, start in enumerate(startTimes):
+        startInd = np.searchsorted(spikes, start)
+        endInd = np.searchsorted(spikes, start + windowDur)
+        counts = counts + np.histogram(spikes[startInd:endInd] - start, bins)[0]
+
+    counts = counts / startTimes.size
+    counts = np.convolve(counts, convkernel) / (binSize * convkernel.size)
+    return (
+        counts[convkernel.size - 1 : -convkernel.size],
+        bins[: -convkernel.size - 1],
+    )
+
 
 
 if __name__ == "__main__":

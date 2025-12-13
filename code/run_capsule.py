@@ -1,222 +1,172 @@
-# stdlib imports --------------------------------------------------- #
-import argparse
-import dataclasses
 import json
-import functools
-import logging
-import pathlib
-import time
-import types
-import typing
-import uuid
-from typing import Any, Literal
+from typing import Iterable
 
-# 3rd-party imports necessary for processing ----------------------- #
+import lazynwb
+import polars as pl
+import polars_ds as pds
+import polars_vec_ops as vec
 import numpy as np
-import numpy.typing as npt
-import pandas as pd
-import matplotlib
-import matplotlib.pyplot as plt
-import sklearn
-import pynwb
+import pydantic_settings
+import pydantic
+import tqdm
 import upath
-import zarr
 
 import utils
 
-# logging configuration -------------------------------------------- #
-# use `logger.info(msg)` instead of `print(msg)` so we get timestamps and origin of log messages
-logger = logging.getLogger(
-    pathlib.Path(__file__).stem if __name__.endswith("_main__") else __name__
-    # multiprocessing gives name '__mp_main__'
-)
+PSTH_DIR = upath.UPath('s3://aind-scratch-data/dynamic-routing/psths')
+NEURAL_TRAJ_DIR = upath.UPath('s3://aind-scratch-data/dynamic-routing/neural_trajectory_separation')
 
-# general configuration -------------------------------------------- #
-matplotlib.rcParams['pdf.fonttype'] = 42
-logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR) # suppress matplotlib font warnings on linux
+class Params(pydantic_settings.BaseSettings):
+    name: str | None = pydantic.Field(None, exclude=True)
+    skip_existing: bool = pydantic.Field(True, exclude=True)
+    n_resample_iterations: int = 100
+
+    # set the priority of the input sources:
+    @classmethod  
+    def settings_customise_sources(
+        cls,
+        settings_cls,
+        init_settings,
+        *args,
+        **kwargs,
+    ):
+        # instantiating the class will use arguments passed directly, or provided via the command line/app panel
+        # the order of the sources below defines the priority (highest to lowest):
+        # - for each field in the class, the first source that contains a value will be used
+        return (
+            init_settings,
+            pydantic_settings.sources.JsonConfigSettingsSource(settings_cls, json_file='parameters.json'),
+            pydantic_settings.CliSettingsSource(settings_cls, cli_parse_args=True),
+        )
+
+units = utils.get_df('units')
 
 
-# utility functions ------------------------------------------------ #
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--session_id', type=str, default=None)
-    parser.add_argument('--logging_level', type=str, default='INFO')
-    parser.add_argument('--test', type=int, default=0)
-    parser.add_argument('--update_packages_from_source', type=int, default=1)
-    parser.add_argument('--session_table_query', type=str, default="is_ephys & is_task & is_annotated & is_production & issues=='[]'")
-    parser.add_argument('--override_params_json', type=str, default="{}")
-    for field in dataclasses.fields(Params):
-        if field.name in [getattr(action, 'dest') for action in parser._actions]:
-            # already added field above
+def sessionwise_trajectory_distances(lf: pl.LazyFrame, context_1: str, context_2: str, group_by: str | Iterable[str] | None = None, streaming: bool = True) -> pl.DataFrame:
+    if isinstance(lf, pl.DataFrame):
+        streaming = False
+    lf = lf.lazy()
+    if group_by is None:
+        group_by = []
+    elif isinstance(group_by, str):
+        group_by = [group_by]
+    group_by = tuple(group_by)
+    return (
+        lf
+        .filter(pl.col('context_state').is_in([context_1, context_2]))
+        .group_by('unit_id', 'context_state', *group_by)
+        .agg(pl.col('psth').first()) # should only be one psth)
+        .collect(engine='streaming' if streaming else 'auto')
+        .pivot(on='context_state', values='psth')
+        .with_columns(
+            pl.col(context_1).sub(context_2).list.eval(pl.element().pow(2)).alias('diff^2')
+        )
+        .group_by(*group_by or ['unit_id'])
+        .agg(
+            pl.all(),
+            pl.lit(f"{context_1}_vs_{context_2}").alias('contexts'),
+            vec.sum('diff^2').list.eval(pl.element().sqrt()).truediv(pl.col('unit_id').count().sqrt()).alias('traj_separation'),
+        )
+        .drop('diff^2', context_1, context_2)
+    )
+
+def write_neural_trajectories(psth_dir: upath.UPath, params: Params) -> None:
+    root_dir = NEURAL_TRAJ_DIR / psth_dir.name
+
+    # write full set of trajectory separation data for each area
+    for psth_path in psth_dir.glob('*.parquet'):
+        area = psth_path.stem
+        all_traj_sep_path = root_dir / f"{area}.parquet"
+        if params.skip_existing and all_traj_sep_path.exists():
+            print(f'Skipping {area}: parquet already on S3')
             continue
-        logger.debug(f"adding argparse argument {field}")
-        kwargs = {}
-        if isinstance(field.type, str):
-            kwargs = {'type': eval(field.type)}
-        else:
-            kwargs = {'type': field.type}
-        if kwargs['type'] in (list, tuple):
-            logger.debug(f"Cannot correctly parse list-type arguments from App Builder: skipping {field.name}")
-        if isinstance(field.type, str) and field.type.startswith('Literal'):
-            kwargs['type'] = str
-        if isinstance(kwargs['type'], (types.UnionType, typing._UnionGenericAlias)):
-            kwargs['type'] = typing.get_args(kwargs['type'])[0]
-            logger.info(f"setting argparse type for union type {field.name!r} ({field.type}) as first component {kwargs['type']!r}")
-        parser.add_argument(f'--{field.name}', **kwargs)
-    args = parser.parse_args()
-    list_args = [k for k,v in vars(args).items() if type(v) in (list, tuple)]
-    if list_args:
-        raise NotImplementedError(f"Cannot correctly parse list-type arguments from App Builder: remove {list_args} parameter and provide values via `override_params_json` instead")
-    logger.info(f"{args=}")
-    return args
 
-# processing function ---------------------------------------------- #
-# modify the body of this function, but keep the same signature
-def process_session(session_id: str, params: "Params", test: int = 0) -> None:
-    """Process a single session with parameters defined in `params` and save results + params to
-    /results.
-    
-    A test mode should be implemented to allow for quick testing of the capsule (required every time
-    a change is made if the capsule is in a pipeline) 
-    """
-    # Get nwb file
-    # Currently this can fail for two reasons: 
-    # - the file is missing from the datacube, or we have the path to the datacube wrong (raises a FileNotFoundError)
-    # - the file is corrupted due to a bad write (raises a RecursionError)
-    # Choose how to handle these as appropriate for your capsule
-    try:
-        nwb = utils.get_nwb(session_id, raise_on_missing=True, raise_on_bad_file=True) 
-    except (FileNotFoundError, RecursionError) as exc:
-        logger.info(f"Skipping {session_id}: {exc!r}")
-        return
-    
-    # Get components from the nwb file:
-    trials_df = nwb.trials[:]
-    units_df = nwb.units[:]
-    
-    # Process data here, with test mode implemented to break out of the loop early:
-    logger.info(f"Processing {session_id} with {params.to_json()}")
-    results = {}
-    for structure, structure_df in units_df.groupby('structure'):
-        results[structure] = len(structure_df)
-        if test:
-            logger.info("TEST | Exiting after first structure")
-            break
+        lf = pl.scan_parquet(psth_path.as_posix())
+        if 'resample_iteration' in lf.collect_schema():
+            lf = (
+                lf
+                .filter(pl.col('resample_iteration').is_null()) 
+                .drop('resample_iteration')
+            )
 
-    # Save data to files in /results
-    # If the same name is used across parallel runs of this capsule in a pipeline, a name clash will
-    # occur and the pipeline will fail, so use session_id as filename prefix:
-    #   /results/<sessionId>.suffix
-    logger.info(f"Writing results for {session_id}")
-    np.savez(f'/results/{session_id}.npz', **results)
-    params.write_json(f'/results/{session_id}.json')
+        def resample_units(lf: pl.LazyFrame, seed: int) -> pl.LazyFrame:
+            return (
+                lf
+                .sort('unit_id') # sorting and maintaining order critical to ensure same unit sample for each context
+                .group_by('session_id', 'context_state', maintain_order=True)
+                .agg(pl.all().sample(fraction=1, with_replacement=True, seed=seed))
+                .explode(pl.all().exclude('session_id', 'context_state'))
+            )
+        null_iter = pl.col('null_iteration').is_null()
+        named_lfs = {
+            'actual': lf.filter(null_iter),
+            'null': lf.filter(~null_iter),
+            'resampled units': lf.filter(null_iter),
+        }
 
-# define run params here ------------------------------------------- #
+        name_df_context_pair: list[tuple[str, pl.DataFrame, tuple[str, str]]] = []
+        for name, named_lf in named_lfs.items():
+            for context_1, context_2 in [('AA', 'AV'), ('VA', 'VV')]:
+                print(f"Processing: {area} | {name} trajectories | {context_1} vs {context_2}")
+                n = params.n_resample_iterations if name == 'resampled units' else 1
+                if name == 'resampled units':
+                    # fetch df to avoid reading 100 times
+                    named_lf = named_lf.collect().lazy()
+                for i in range(n):
+                    if name == 'resampled units':
+                        named_lf = named_lf.pipe(resample_units, seed=i)
+                    df = sessionwise_trajectory_distances(named_lf, context_1=context_1, context_2=context_2, group_by=['session_id', 'null_iteration'], streaming=True)
+                    name_df_context_pair.append((name, df, (context_1, context_2)))
 
-# The `Params` class is used to store parameters for the run, for passing to the processing function.
-# @property fields (like `bins` below) are computed from other parameters on-demand as required:
-# this way, we can separate the parameters dumped to json from larger arrays etc. required for
-# processing.
+        # calculate average null for each session:
+        null_avgs = (
+            pl.concat([df for name, df, _ in name_df_context_pair if name == 'null'])
+            .group_by('session_id', 'contexts')
+            .agg(
+                vec.avg('traj_separation').alias('avg_null_traj_separation'),
+            )
+        )
 
-# - if needed, we can get parameters from the command line (like `nUnitSamples` below) and pass them
-#   to the dataclass (see `main()` below)
+        # store other dfs, with an additional null subtracted column
+        dfs: list[pl.DataFrame] = []
+        for name, df, (context_1, context_2) in name_df_context_pair:
+            if name == 'null':
+                continue
+            dfs.append(
+                df
+                .drop('null_iteration')
+                .join(null_avgs, on=['session_id', 'contexts'], how='inner')
+                .with_columns(
+                    null_subtracted_traj_separation=pl.col('traj_separation') - pl.col('avg_null_traj_separation'),
+                )
+            )
 
-# this is an example from Sam's processing code, replace with your own parameters as needed:
-@dataclasses.dataclass
-class Params:
-    session_id: str
-    
-    nUnitSamples: int = 20
-    unitSampleSize: int = 20
-    windowDur: float = 1
-    binSize: float = 1
-    nShuffles: int | str = 100
-    binStart: int = -windowDur
-    n_units: list = dataclasses.field(default_factory=lambda: [5, 10, 20, 40, 60, 'all'])
-    decoder_type: str | Literal['linearSVC', 'LDA', 'RandomForest', 'LogisticRegression'] = 'LogisticRegression'
+        print(f"Writing {all_traj_sep_path.as_posix()}")
+        (
+            pl.concat(dfs)
+            .with_columns(pl.lit(area).alias('area'))
+        ).write_parquet(all_traj_sep_path.as_posix())
 
-    @property
-    def bins(self) -> npt.NDArray[np.float64]:
-        return np.arange(self.binStart, self.windowDur+self.binSize, self.binSize)
-
-    @property
-    def nBins(self) -> int:
-        return self.bins.size - 1
-    
-    def to_dict(self) -> dict[str, Any]:
-        """dict of field name: value pairs, including values from property getters"""
-        return dataclasses.asdict(self) | {k: getattr(self, k) for k in dir(self.__class__) if isinstance(getattr(self.__class__, k), property)}
-
-    def to_json(self, **dumps_kwargs) -> str:
-        """json string of field name: value pairs, excluding values from property getters (which may be large)"""
-        return json.dumps(dataclasses.asdict(self), **dumps_kwargs)
-
-    def write_json(self, path: str | upath.UPath = '/results/params.json') -> None:
-        path = upath.UPath(path)
-        logger.info(f"Writing params to {path}")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self.to_json(indent=2))
-
-# ------------------------------------------------------------------ #
-
-
-def main():
-    t0 = time.time()
-    
-    utils.setup_logging()
-
-    # get arguments passed from command line (or "AppBuilder" interface):
-    args = parse_args()
-    logger.setLevel(args.logging_level)
-
-    # if any of the parameters required for processing are passed as command line arguments, we can
-    # get a new params object with these values in place of the defaults:
-
-    params = {}
-    for field in dataclasses.fields(Params):
-        if (val := getattr(args, field.name, None)) is not None:
-            params[field.name] = val
-    
-    override_params = json.loads(args.override_params_json)
-    if override_params:
-        for k, v in override_params.items():
-            if k in params:
-                logger.info(f"Overriding value of {k!r} from command line arg with value specified in `override_params_json`")
-            params[k] = v
-            
-    # if session_id is passed as a command line argument, we will only process that session,
-    # otherwise we process all session IDs that match filtering criteria:    
-    session_table = pd.read_parquet(utils.get_datacube_dir() / 'session_table.parquet')
-    session_table['issues']=session_table['issues'].astype(str)
-    session_ids: list[str] = session_table.query(args.session_table_query)['session_id'].values.tolist()
-    logger.debug(f"Found {len(session_ids)} session_ids available for use after filtering")
-    
-    if args.session_id is not None:
-        if args.session_id not in session_ids:
-            logger.warning(f"{args.session_id!r} not in filtered session_ids: exiting")
-            exit()
-        logger.info(f"Using single session_id {args.session_id} provided via command line argument")
-        session_ids = [args.session_id]
-    elif utils.is_pipeline(): 
-        # only one nwb will be available 
-        session_ids = set(session_ids) & set(p.stem for p in utils.get_nwb_paths())
-    else:
-        logger.info(f"Using list of {len(session_ids)} session_ids after filtering")
-    
-    # run processing function for each session, with test mode implemented:
-    for session_id in session_ids:
-        try:
-            process_session(session_id, params=Params(session_id=session_id, **params), test=args.test, skip_existing=args.skip_existing)
-        except Exception as e:
-            logger.exception(f'{session_id} | Failed:')
-        else:
-            logger.info(f'{session_id} | Completed')
-
-        if args.test:
-            logger.info("Test mode: exiting after first session")
-            break
-    utils.ensure_nonempty_results_dir()
-    logger.info(f"Time elapsed: {time.time() - t0:.2f} s")
 
 if __name__ == "__main__":
-    main()
+
+    params = Params()
+    if params.name:
+        psth_dirs = [PSTH_DIR / params.name]
+        if not psth_dirs[0].exists():
+            raise FileNotFoundError(f"PSTH directory does not exist: {psth_dirs[0]}")
+    else:
+        psth_dirs = list(d for d in PSTH_DIR.glob('*') if d.is_dir() if d.with_suffix('.json').exists())
+        if not psth_dirs:
+            raise FileNotFoundError(f"No valid PSTH directories found in {PSTH_DIR}")
+
+    for i, psth_dir in enumerate(sorted(psth_dirs, reverse=True)):
+        print(f"{i+1}/{len(psth_dirs)} | Processing PSTHs in {psth_dir.name}")
+
+        original_json = json.loads((PSTH_DIR / f'{psth_dir.name}.json').read_text())
+        new_json_path = NEURAL_TRAJ_DIR / f'{psth_dir.name}.json'
+        new_json_path.write_text(json.dumps(original_json | params.model_dump(), indent=4))
+
+        write_neural_trajectories(psth_dir, params)
+
+    print(f"All finished")
