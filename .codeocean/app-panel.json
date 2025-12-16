@@ -9,7 +9,8 @@
 			"description": "name of a folder in s3://aind-scratch-data/dynamic-routing/psth. If empty, all folders will be processed",
 			"help_text": "name of a folder in s3://aind-scratch-data/dynamic-routing/psth. If empty, all folders will be processed",
 			"type": "text",
-			"value_type": "string"
+			"value_type": "string",
+			"default_value": "2025-12-11"
 		},
 		{
 			"id": "GF7D58JyuhalWflw",

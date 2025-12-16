@@ -1,5 +1,5 @@
 metadata_version: 1
-name: dynamicrouting-write-neural-traj-sep
+name: dynamicrouting-write-fa-hit-neural-traj-sep
 description: Basic structure of a capsule to be customized as needed.
 authors:
 - name: Ben Hardcastle

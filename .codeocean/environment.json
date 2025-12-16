@@ -28,13 +28,13 @@
 					"name": "numba"
 				},
 				{
-					"name": "pedantic-settings"
-				},
-				{
 					"name": "polars-ds"
 				},
 				{
 					"name": "polars-vec-ops"
+				},
+				{
+					"name": "pydantic-settings"
 				}
 			],
 			"options": {},

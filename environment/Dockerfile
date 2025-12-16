@@ -1,4 +1,4 @@
-# hash:sha256:35da401dd2165404320f7f84cf3593e69773d2ba8b29ff6aa5e5d48cab9c3492
+# hash:sha256:59b138b7ccc9b9433b3ea7003fd266a89a06a70f062651f97ab115b655db9279
 ARG REGISTRY_HOST
 FROM $REGISTRY_HOST/codeocean/mambaforge3:23.1.0-4-python3.10.12-ubuntu22.04
 
@@ -15,6 +15,6 @@ RUN pip3 install -U --no-cache-dir \
     cloudpickle \
     lazynwb \
     numba \
-    pedantic-settings \
     polars-ds \
-    polars-vec-ops
+    polars-vec-ops \
+    pydantic-settings
