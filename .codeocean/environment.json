@@ -19,26 +19,53 @@
 		"pip3": {
 			"packages": [
 				{
-					"name": "cloudpickle"
+					"name": "cloudpickle",
+					"version": "3.1.2"
 				},
 				{
-					"name": "lazynwb"
+					"name": "lazynwb",
+					"version": "0.2.76"
 				},
 				{
-					"name": "numba"
+					"name": "numba",
+					"version": "0.63.1"
 				},
 				{
-					"name": "polars-ds"
+					"name": "polars-ds",
+					"version": "0.10.3"
 				},
 				{
-					"name": "polars-vec-ops"
+					"name": "polars-vec-ops",
+					"version": "0.1.1"
 				},
 				{
-					"name": "pydantic-settings"
+					"name": "pydantic-settings",
+					"version": "2.12.0"
 				}
 			],
 			"options": {},
 			"pre_install_options": {}
+		},
+		"vscode": {
+			"packages": [
+				{
+					"name": "ms-python.python",
+					"version": "2025.14.0"
+				},
+				{
+					"name": "ms-toolsai.jupyter",
+					"version": "2025.4.1"
+				},
+				{
+					"name": "reditorsupport.r",
+					"version": "2.8.6"
+				},
+				{
+					"name": "saoudrizwan.claude-dev",
+					"version": "3.35.1"
+				}
+			],
+			"version": "4.100.3"
 		}
 	}
 }

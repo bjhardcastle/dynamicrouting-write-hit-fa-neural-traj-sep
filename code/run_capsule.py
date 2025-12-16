@@ -14,7 +14,7 @@ import upath
 import utils
 
 PSTH_DIR = upath.UPath('s3://aind-scratch-data/dynamic-routing/psths')
-NEURAL_TRAJ_DIR = upath.UPath('s3://aind-scratch-data/dynamic-routing/neural_trajectory_separation')
+NEURAL_TRAJ_DIR = upath.UPath('s3://aind-scratch-data/dynamic-routing/neural_trajectory_separation_hit_fa')
 
 class Params(pydantic_settings.BaseSettings):
     name: str | None = pydantic.Field(None, exclude=True)
@@ -42,7 +42,7 @@ class Params(pydantic_settings.BaseSettings):
 units = utils.get_df('units')
 
 
-def sessionwise_trajectory_distances(lf: pl.LazyFrame, context_1: str, context_2: str, group_by: str | Iterable[str] | None = None, streaming: bool = True) -> pl.DataFrame:
+def sessionwise_trajectory_distances(lf: pl.LazyFrame, label_1: str, label_2: str, group_by: str | Iterable[str] | None = None, streaming: bool = True) -> pl.DataFrame:
     if isinstance(lf, pl.DataFrame):
         streaming = False
     lf = lf.lazy()
@@ -53,21 +53,22 @@ def sessionwise_trajectory_distances(lf: pl.LazyFrame, context_1: str, context_2
     group_by = tuple(group_by)
     return (
         lf
-        .filter(pl.col('context_state').is_in([context_1, context_2]))
+        .filter(pl.col('context_state').is_in([label_1, label_2]))
         .group_by('unit_id', 'context_state', *group_by)
         .agg(pl.col('psth').first()) # should only be one psth)
         .collect(engine='streaming' if streaming else 'auto')
         .pivot(on='context_state', values='psth')
         .with_columns(
-            pl.col(context_1).sub(context_2).list.eval(pl.element().pow(2)).alias('diff^2')
+            pl.col(label_1).sub(label_2).list.eval(pl.element().pow(2)).alias('diff^2')
         )
         .group_by(*group_by or ['unit_id'])
         .agg(
             pl.all(),
-            pl.lit(f"{context_1}_vs_{context_2}").alias('contexts'),
-            vec.sum('diff^2').list.eval(pl.element().sqrt()).truediv(pl.col('unit_id').count().sqrt()).alias('traj_separation'),
+            pl.lit(f"{label_1}_vs_{label_2}").alias('description'),
+            vec.sum('diff^2').list.eval(pl.element().sqrt()).truediv(pl.col('unit_id').count().sqrt()).cast(pl.List(pl.Float64)).alias('traj_separation'),
+            # ^ cast ensures compat with any list[null] 
         )
-        .drop('diff^2', context_1, context_2)
+        .drop('diff^2', label_1, label_2)
     )
 
 def write_neural_trajectories(psth_dir: upath.UPath, params: Params) -> None:
@@ -82,12 +83,6 @@ def write_neural_trajectories(psth_dir: upath.UPath, params: Params) -> None:
             continue
 
         lf = pl.scan_parquet(psth_path.as_posix())
-        if 'resample_iteration' in lf.collect_schema():
-            lf = (
-                lf
-                .filter(pl.col('resample_iteration').is_null()) 
-                .drop('resample_iteration')
-            )
 
         def resample_units(lf: pl.LazyFrame, seed: int) -> pl.LazyFrame:
             return (
@@ -104,24 +99,35 @@ def write_neural_trajectories(psth_dir: upath.UPath, params: Params) -> None:
             'resampled units': lf.filter(null_iter),
         }
 
+        vis_hit_expr = pl.col('is_vis_target') & pl.col('is_hit')
+        aud_hit_expr = pl.col('is_aud_target') & pl.col('is_hit')
+        vis_confident_false_alarm_expr =  pl.col('is_vis_target') & pl.col('is_false_alarm') & pl.col('predict_proba').is_in(["(-inf, 0.2]", "(0.2, 0.4]"])
+        aud_confident_false_alarm_expr =  pl.col('is_aud_target') & pl.col('is_false_alarm') & pl.col('predict_proba').is_in(["(0.6, 0.8]", "(0.8, inf]"])
+
         name_df_context_pair: list[tuple[str, pl.DataFrame, tuple[str, str]]] = []
         for name, named_lf in named_lfs.items():
-            for context_1, context_2 in [('AA', 'AV'), ('VA', 'VV')]:
-                print(f"Processing: {area} | {name} trajectories | {context_1} vs {context_2}")
+            for label_1, context_1, label_2, context_2 in [
+                ('vis_hit', vis_hit_expr, 'vis_fa', vis_confident_false_alarm_expr), 
+                ('aud_hit', aud_hit_expr, 'aud_fa', aud_confident_false_alarm_expr),
+            ]:
+                print(f"Processing: {area} | {name} trajectories | {label_1} vs {label_2}")
                 n = params.n_resample_iterations if name == 'resampled units' else 1
                 if name == 'resampled units':
                     # fetch df to avoid reading 100 times
                     named_lf = named_lf.collect().lazy()
+                named_lf = named_lf.with_columns(pl.when(context_1).then(pl.lit(label_1)).when(context_2).then(pl.lit(label_2)).alias('context_state'))
                 for i in range(n):
                     if name == 'resampled units':
                         named_lf = named_lf.pipe(resample_units, seed=i)
-                    df = sessionwise_trajectory_distances(named_lf, context_1=context_1, context_2=context_2, group_by=['session_id', 'null_iteration'], streaming=True)
-                    name_df_context_pair.append((name, df, (context_1, context_2)))
+                    df = sessionwise_trajectory_distances(named_lf, label_1=label_1, label_2=label_2, group_by=['session_id', 'null_iteration'], streaming=True)
+                    name_df_context_pair.append((name, df, (label_1, label_2)))
+
+#! TODO FIX FILTERING FOR NULL
 
         # calculate average null for each session:
         null_avgs = (
             pl.concat([df for name, df, _ in name_df_context_pair if name == 'null'])
-            .group_by('session_id', 'contexts')
+            .group_by('session_id', 'description')
             .agg(
                 vec.avg('traj_separation').alias('avg_null_traj_separation'),
             )
@@ -129,13 +135,13 @@ def write_neural_trajectories(psth_dir: upath.UPath, params: Params) -> None:
 
         # store other dfs, with an additional null subtracted column
         dfs: list[pl.DataFrame] = []
-        for name, df, (context_1, context_2) in name_df_context_pair:
+        for name, df, _ in name_df_context_pair:
             if name == 'null':
                 continue
             dfs.append(
                 df
                 .drop('null_iteration')
-                .join(null_avgs, on=['session_id', 'contexts'], how='inner')
+                .join(null_avgs, on=['session_id', 'description'], how='inner')
                 .with_columns(
                     null_subtracted_traj_separation=pl.col('traj_separation') - pl.col('avg_null_traj_separation'),
                 )
@@ -165,7 +171,7 @@ if __name__ == "__main__":
 
         original_json = json.loads((PSTH_DIR / f'{psth_dir.name}.json').read_text())
         new_json_path = NEURAL_TRAJ_DIR / f'{psth_dir.name}.json'
-        new_json_path.write_text(json.dumps(original_json | params.model_dump(), indent=4))
+        # new_json_path.write_text(json.dumps(original_json | params.model_dump(), indent=4))
 
         write_neural_trajectories(psth_dir, params)
 
